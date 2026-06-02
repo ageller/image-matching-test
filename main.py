@@ -6,7 +6,7 @@ from transforms import (
     rotate_image, apply_gamma, apply_perspective, apply_translation, apply_zoom,
     apply_alignment,
 )
-from matching import find_best_alignment
+from matching import find_best_alignment, find_best_alignment_de
 from diagnostics import create_diagnostic_image
 
 
@@ -23,12 +23,22 @@ def run_simulation_test(
       3. Save a diagnostic PNG showing reference / input / aligned images
          alongside a table of applied vs found vs expected values.
     """
-    # Which transforms to search — toggle to test subsets incrementally.
-    # The simulation always applies all transforms regardless of these flags.
+    # Which transforms to APPLY when simulating the second photo.
+    # Toggle these to build a simpler test case (e.g. rotation only).
+    # A disabled transform collapses to its neutral value (nothing applied).
+    sim_rotation = True
+    sim_zoom = True
+    sim_translation = True
+    sim_perspective = True
+    sim_gamma = True
+
+    # Which transforms to SEARCH during matching — toggle to test subsets.
+    # Independent of the sim_* flags above, but for a clean test the searched
+    # set should match (or be a superset of) the applied set.
     search_rotation = True
-    search_zoom = False
-    search_translation = False
-    search_perspective = False
+    search_zoom = True
+    search_translation = True
+    search_perspective = True
 
     # Search step sizes — adjust to trade off speed vs precision.
     step_rot = 1.0    # degrees, in-plane rotation
@@ -39,6 +49,34 @@ def run_simulation_test(
     zoom_values = (0.70, 0.75, 0.80, 0.85, 0.90, 0.95,
                    1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40)
     zoom_step = round(zoom_values[1] - zoom_values[0], 4)   # = 0.05
+
+    # Feature compared (norm_method): None | 'clahe' | 'gradient'.
+    # None       — raw intensity, cleanest baseline.
+    # 'gradient' — lighting-robust and rotation-equivariant.
+    # 'clahe'    — lighting-robust but not rotation-equivariant.
+    # Correlation (corr_method): 'pearson' | 'spearman'.
+    # 'spearman' is rank-based, exactly gamma-invariant — use when gamma is on.
+    # blur_sigma > 0 smooths the correlation landscape (0 disables).
+    norm_method = None
+    corr_method = "spearman"
+    blur_sigma = 0.0
+
+    # Matcher: 'greedy' (coordinate-descent sweep) | 'de' (Differential
+    # Evolution — global, joint optimization of all parameters at once).
+    matcher = "de"
+
+    # Iterative refinement (GREEDY MATCHER ONLY — ignored when matcher == 'de'):
+    # re-sweep the search up to n_passes times so coupled parameters (esp.
+    # rotation↔translation) re-converge.  Stops early when a pass changes
+    # nothing.  verbose prints each pass's parameter vector.
+    n_passes = 3
+
+    # DE controls (only used when matcher == 'de').
+    de_popsize = 15     # population = popsize * n_enabled_params
+    de_maxiter = 100    # max generations
+    de_tol = 0.01       # convergence tolerance
+    de_seed = 1234567   # reproducibility (DE is stochastic)
+    de_downscale = 1.0  # 1.0 = full res; lower trades accuracy for speed
 
     random.seed(1234567)
 
@@ -63,21 +101,23 @@ def run_simulation_test(
 
         # Simulate a second image: rotation + perspective + translation + zoom + gamma.
         # In production these would be two separately captured photos of the same person.
-        rotation_applied = random.uniform(10.0, 350.0)
-        pan_applied = random.choice(
-            [random.uniform(-30, -5),  random.uniform(5, 30)])
-        tilt_applied = random.choice(
-            [random.uniform(-20, -5),  random.uniform(5, 20)])
-        x_applied = random.choice(
-            [random.uniform(-40, -10), random.uniform(10, 40)])
-        y_applied = random.choice(
-            [random.uniform(-40, -10), random.uniform(10, 40)])
-        zoom_applied = random.choice(
-            [random.uniform(0.75, 0.90), random.uniform(1.10, 1.35)])
-        gamma_applied = random.choice([
+        # Each transform is only applied if its sim_* flag is on; otherwise the
+        # value collapses to neutral (rot=0, pan/tilt=0, dx/dy=0, zoom=1, gamma=1).
+        rotation_applied = random.uniform(10.0, 350.0) if sim_rotation else 0.0
+        pan_applied = (random.choice([random.uniform(-30, -5), random.uniform(5, 30)])
+                       if sim_perspective else 0.0)
+        tilt_applied = (random.choice([random.uniform(-20, -5), random.uniform(5, 20)])
+                        if sim_perspective else 0.0)
+        x_applied = (random.choice([random.uniform(-40, -10), random.uniform(10, 40)])
+                     if sim_translation else 0.0)
+        y_applied = (random.choice([random.uniform(-40, -10), random.uniform(10, 40)])
+                     if sim_translation else 0.0)
+        zoom_applied = (random.choice([random.uniform(0.75, 0.90), random.uniform(1.10, 1.35)])
+                        if sim_zoom else 1.0)
+        gamma_applied = (random.choice([
             random.uniform(0.2, 0.5),   # overexposed / bright environment
             random.uniform(1.5, 4.0),   # underexposed / dim environment
-        ])
+        ]) if sim_gamma else 1.0)
 
         match = apply_gamma(
             apply_zoom(
@@ -100,22 +140,64 @@ def run_simulation_test(
         ] if on) or "none"
         print(f"  Searching: {active}")
 
-        best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr, curves = \
-            find_best_alignment(
-                reference, match,
-                search_rotation=search_rotation,
-                search_zoom=search_zoom,
-                search_translation=search_translation,
-                search_perspective=search_perspective,
-                step_rot=step_rot,
-                step_persp=step_persp,
-                persp_range=persp_range,
-                step_trans=step_trans,
-                trans_range=trans_range,
-                zoom_values=zoom_values,
-            )
+        if matcher == "de":
+            best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr, curves = \
+                find_best_alignment_de(
+                    reference, match,
+                    search_rotation=search_rotation,
+                    search_zoom=search_zoom,
+                    search_translation=search_translation,
+                    search_perspective=search_perspective,
+                    persp_range=persp_range,
+                    trans_range=trans_range,
+                    zoom_values=zoom_values,
+                    norm_method=norm_method,
+                    corr_method=corr_method,
+                    blur_sigma=blur_sigma,
+                    popsize=de_popsize,
+                    maxiter=de_maxiter,
+                    tol=de_tol,
+                    seed=de_seed,
+                    downscale=de_downscale,
+                    verbose=True,
+                )
+        else:
+            best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr, curves = \
+                find_best_alignment(
+                    reference, match,
+                    search_rotation=search_rotation,
+                    search_zoom=search_zoom,
+                    search_translation=search_translation,
+                    search_perspective=search_perspective,
+                    step_rot=step_rot,
+                    step_persp=step_persp,
+                    persp_range=persp_range,
+                    step_trans=step_trans,
+                    trans_range=trans_range,
+                    zoom_values=zoom_values,
+                    norm_method=norm_method,
+                    corr_method=corr_method,
+                    blur_sigma=blur_sigma,
+                    n_passes=n_passes,
+                    verbose=True,
+                )
 
         exp_rot = (360.0 - rotation_applied) % 360.0
+
+        # Annotate each curve with the expected (true inverse) value so the
+        # diagnostic plots can draw a reference line alongside the found value.
+        expected_by_key = {
+            'rotation': exp_rot,
+            'zoom':     1.0 / zoom_applied,
+            'dx': -x_applied,
+            'dy': -y_applied,
+            'pan': -pan_applied,
+            'tilt': -tilt_applied,
+        }
+        for key, exp_val in expected_by_key.items():
+            if key in curves:
+                curves[key]['expected'] = exp_val
+
         print(f"  Found    rot={best_angle:+.1f}  pan={best_pan:+.1f}"
               f"  tilt={best_tilt:+.1f}  x={best_dx:+.0f}"
               f"  y={best_dy:+.0f}  zoom={best_zoom:.2f}")
@@ -154,6 +236,14 @@ def run_simulation_test(
             search_zoom=search_zoom,
             search_translation=search_translation,
             search_perspective=search_perspective,
+            norm_method=norm_method,
+            corr_method=corr_method,
+            matcher=matcher,
+            n_passes=n_passes,
+            de_settings={
+                'popsize': de_popsize, 'maxiter': de_maxiter, 'tol': de_tol,
+                'seed': de_seed, 'downscale': de_downscale,
+            },
             curves=curves,
             output_path=str(out_path / f"{img_path.stem}_diagnostic.png"),
         )
@@ -190,7 +280,7 @@ def align_real_images(
     print(f"  Searching: rotation 360 deg | pan/tilt ±30 deg"
           f" | x/y ±50 px | zoom 0.70-1.40 ...")
 
-    best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr = \
+    best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr, _ = \
         find_best_alignment(reference, match)
 
     match_aligned = apply_alignment(match, angle=best_angle, pan=best_pan,

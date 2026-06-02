@@ -31,15 +31,25 @@ def render_correlation_plots(curves: dict, total_w: int) -> np.ndarray:
         y = np.asarray(data['y'], dtype=float)
 
         ax.plot(x, y, color='#7ab8e8', linewidth=1.2)
+
+        yrange = float(y.max() - y.min()) or 0.01
+
+        # Found value — yellow dashed
         ax.axvline(data['best'], color='#f0c040', linewidth=1.2,
                    linestyle='--', alpha=0.9)
-        # Label the best value above the marker
-        yrange = float(y.max() - y.min()) or 0.01
         ax.text(data['best'], float(y.max()) + yrange * 0.04,
                 f'{data["best"]:.3g}',
                 ha='center', va='bottom', color='#f0c040', fontsize=5.5)
 
-        ax.set_title(data['label'], color='#cccccc', fontsize=7, pad=3)
+        # Expected (true inverse) value — green dotted, if provided
+        if 'expected' in data:
+            ax.axvline(data['expected'], color='#88dd88', linewidth=1.0,
+                       linestyle=':', alpha=0.85)
+            ax.text(data['expected'], float(y.max()) + yrange * 0.04,
+                    f'{data["expected"]:.3g}',
+                    ha='center', va='bottom', color='#88dd88', fontsize=5.5)
+
+        ax.set_xlabel(data['label'], color='#aaaaaa', fontsize=6.5, labelpad=2)
         ax.tick_params(colors='#888888', labelsize=6, length=2, width=0.5)
         for spine in ax.spines.values():
             spine.set_color('#444444')
@@ -85,6 +95,11 @@ def create_diagnostic_image(
     search_zoom: bool = True,
     search_translation: bool = True,
     search_perspective: bool = True,
+    norm_method: str = "gradient",
+    corr_method: str = "pearson",
+    matcher: str = "greedy",
+    n_passes: int = 1,
+    de_settings: dict = None,
     curves: dict = None,
     output_path: str = "diagnostic.png",
 ) -> None:
@@ -96,7 +111,10 @@ def create_diagnostic_image(
                 Applied — values used to create the simulated image
                 Found   — values recovered by the search algorithm
                 Error   — found minus expected-inverse (0 = perfect recovery)
-                Step    — search step size used for each parameter
+                Step    — greedy search step per parameter ('__' when matcher
+                          is DE, which has no per-parameter step)
+      The footer line shows the matcher and its settings (n_passes for greedy,
+      population/iterations/tol/seed/downscale for DE).
     """
     PANEL   = 300
     GAP     = 8
@@ -194,6 +212,21 @@ def create_diagnostic_image(
     ROW_Y0 = SEP1_Y + 14   # baseline of first data row
     ROW_H  = 17
 
+    # Step row cells: DE has no per-parameter step, so show '--' everywhere;
+    # greedy shows each step size, or '---' for a disabled transform.
+    if matcher == "de":
+        step_cells = ("--", "--", "--", "--", "--", "--", "")
+    else:
+        step_cells = (
+            f"{step_rot:.1f}"   if search_rotation    else "---",
+            f"{step_persp:.1f}" if search_perspective else "---",
+            f"{step_persp:.1f}" if search_perspective else "---",
+            f"{step_trans:.1f}" if search_translation else "---",
+            f"{step_trans:.1f}" if search_translation else "---",
+            f"{zoom_step:.2f}"  if search_zoom        else "---",
+            "",
+        )
+
     # (label, rot, pan, tilt, x, y, zoom, gamma)
     rows = [
         ("Applied:",
@@ -212,14 +245,7 @@ def create_diagnostic_image(
          f"{rot_err:+.1f}", f"{pan_err:+.1f}", f"{tilt_err:+.1f}",
          f"{x_err:+.0f}", f"{y_err:+.0f}",
          f"{zoom_err:+.2f}", ""),
-        ("Step:",
-         f"{step_rot:.1f}"   if search_rotation    else "---",
-         f"{step_persp:.1f}" if search_perspective  else "---",
-         f"{step_persp:.1f}" if search_perspective  else "---",
-         f"{step_trans:.1f}" if search_translation  else "---",
-         f"{step_trans:.1f}" if search_translation  else "---",
-         f"{zoom_step:.2f}"  if search_zoom         else "---",
-         ""),
+        ("Step:", *step_cells),
     ]
 
     for i, (lbl, *vals) in enumerate(rows):
@@ -232,8 +258,19 @@ def create_diagnostic_image(
     # ------------------------------------------------------------------ separators & correlation
     SEP2_Y = ROW_Y0 + len(rows) * ROW_H + 2
     cv2.line(info, (0, SEP2_Y), (total_w, SEP2_Y), DIV_COLOR, 1)
-    put_l(info, f"Correlation score (CLAHE): {correlation:.4f}",
-          LABEL_X, SEP2_Y + ROW_H - 2, CORR_COLOR)
+    corr_y = SEP2_Y + ROW_H - 2
+    put_l(info, f"Correlation score ({norm_method or 'none'}/{corr_method}): {correlation:.4f}",
+          LABEL_X, corr_y, CORR_COLOR)
+
+    # Matcher + its settings, right-aligned on the same footer line.
+    if matcher == "de":
+        s = de_settings or {}
+        matcher_str = (f"Matcher: DE  pop={s.get('popsize')}  iter={s.get('maxiter')}"
+                       f"  tol={s.get('tol')}  seed={s.get('seed')}"
+                       f"  scale={s.get('downscale')}")
+    else:
+        matcher_str = f"Matcher: greedy  n_passes={n_passes}"
+    put_r(info, matcher_str, total_w - LABEL_X, corr_y, CORR_COLOR)
 
     # ------------------------------------------------------------------ vertical dividers
     # Draw between label column and first data column, and between each data column pair.
