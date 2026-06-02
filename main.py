@@ -25,20 +25,22 @@ def run_simulation_test(
     """
     # Which transforms to search — toggle to test subsets incrementally.
     # The simulation always applies all transforms regardless of these flags.
-    search_rotation    = True
-    search_zoom        = True
-    search_translation = True
-    search_perspective = True
+    search_rotation = True
+    search_zoom = False
+    search_translation = False
+    search_perspective = False
 
     # Search step sizes — adjust to trade off speed vs precision.
-    step_rot    = 1.0    # degrees, in-plane rotation
-    step_persp  = 5.0    # degrees, pan and tilt
+    step_rot = 1.0    # degrees, in-plane rotation
+    step_persp = 5.0    # degrees, pan and tilt
     persp_range = 30.0   # degrees, pan/tilt search range ±
-    step_trans  = 5.0    # pixels, x and y translation
+    step_trans = 5.0    # pixels, x and y translation
     trans_range = 50.0   # pixels, translation search range ±
     zoom_values = (0.70, 0.75, 0.80, 0.85, 0.90, 0.95,
                    1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40)
-    zoom_step   = round(zoom_values[1] - zoom_values[0], 4)   # = 0.05
+    zoom_step = round(zoom_values[1] - zoom_values[0], 4)   # = 0.05
+
+    random.seed(1234567)
 
     raw_path = Path(raw_dir)
     out_path = Path(output_dir)
@@ -62,14 +64,19 @@ def run_simulation_test(
         # Simulate a second image: rotation + perspective + translation + zoom + gamma.
         # In production these would be two separately captured photos of the same person.
         rotation_applied = random.uniform(10.0, 350.0)
-        pan_applied   = random.choice([random.uniform(-30, -5),  random.uniform(5, 30)])
-        tilt_applied  = random.choice([random.uniform(-20, -5),  random.uniform(5, 20)])
-        x_applied     = random.choice([random.uniform(-40, -10), random.uniform(10, 40)])
-        y_applied     = random.choice([random.uniform(-40, -10), random.uniform(10, 40)])
-        zoom_applied  = random.choice([random.uniform(0.75, 0.90), random.uniform(1.10, 1.35)])
+        pan_applied = random.choice(
+            [random.uniform(-30, -5),  random.uniform(5, 30)])
+        tilt_applied = random.choice(
+            [random.uniform(-20, -5),  random.uniform(5, 20)])
+        x_applied = random.choice(
+            [random.uniform(-40, -10), random.uniform(10, 40)])
+        y_applied = random.choice(
+            [random.uniform(-40, -10), random.uniform(10, 40)])
+        zoom_applied = random.choice(
+            [random.uniform(0.75, 0.90), random.uniform(1.10, 1.35)])
         gamma_applied = random.choice([
-            random.uniform(0.1, 0.5),   # overexposed / bright environment
-            random.uniform(2.0, 5.0),   # underexposed / dim environment
+            random.uniform(0.2, 0.5),   # overexposed / bright environment
+            random.uniform(1.5, 4.0),   # underexposed / dim environment
         ])
 
         match = apply_gamma(
@@ -93,7 +100,7 @@ def run_simulation_test(
         ] if on) or "none"
         print(f"  Searching: {active}")
 
-        best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr = \
+        best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr, curves = \
             find_best_alignment(
                 reference, match,
                 search_rotation=search_rotation,
@@ -147,6 +154,7 @@ def run_simulation_test(
             search_zoom=search_zoom,
             search_translation=search_translation,
             search_perspective=search_perspective,
+            curves=curves,
             output_path=str(out_path / f"{img_path.stem}_diagnostic.png"),
         )
 

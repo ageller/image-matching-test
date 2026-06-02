@@ -1,5 +1,62 @@
 import cv2
 import numpy as np
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+
+def render_correlation_plots(curves: dict, total_w: int) -> np.ndarray:
+    """Render per-parameter correlation curves as a matplotlib figure.
+
+    Returns a BGR numpy array exactly total_w pixels wide.
+    Curves are laid out in a 3-column grid, one subplot per parameter.
+    Returns a zero-height array when curves is empty (no searches active).
+    """
+    if not curves:
+        return np.zeros((0, total_w, 3), dtype=np.uint8)
+
+    items    = list(curves.items())
+    n_cols   = 3
+    n_rows   = (len(items) + n_cols - 1) // n_cols
+    DPI      = 96
+    ROW_H_PX = 160
+
+    fig = Figure(figsize=(total_w / DPI, n_rows * ROW_H_PX / DPI), dpi=DPI)
+    fig.patch.set_facecolor('#141414')
+
+    for idx, (_, data) in enumerate(items):
+        ax = fig.add_subplot(n_rows, n_cols, idx + 1)
+        ax.set_facecolor('#1c1c1c')
+
+        x = np.asarray(data['x'], dtype=float)
+        y = np.asarray(data['y'], dtype=float)
+
+        ax.plot(x, y, color='#7ab8e8', linewidth=1.2)
+        ax.axvline(data['best'], color='#f0c040', linewidth=1.2,
+                   linestyle='--', alpha=0.9)
+        # Label the best value above the marker
+        yrange = float(y.max() - y.min()) or 0.01
+        ax.text(data['best'], float(y.max()) + yrange * 0.04,
+                f'{data["best"]:.3g}',
+                ha='center', va='bottom', color='#f0c040', fontsize=5.5)
+
+        ax.set_title(data['label'], color='#cccccc', fontsize=7, pad=3)
+        ax.tick_params(colors='#888888', labelsize=6, length=2, width=0.5)
+        for spine in ax.spines.values():
+            spine.set_color('#444444')
+        ax.set_xlim(float(x[0]), float(x[-1]))
+        ax.grid(True, color='#2c2c2c', linewidth=0.5)
+
+    fig.tight_layout(pad=0.5)
+
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    bgr = cv2.cvtColor(np.asarray(canvas.buffer_rgba()), cv2.COLOR_RGBA2BGR)
+
+    if bgr.shape[1] != total_w:
+        h = max(1, round(bgr.shape[0] * total_w / bgr.shape[1]))
+        bgr = cv2.resize(bgr, (total_w, h))
+
+    return bgr
 
 
 def create_diagnostic_image(
@@ -28,6 +85,7 @@ def create_diagnostic_image(
     search_zoom: bool = True,
     search_translation: bool = True,
     search_perspective: bool = True,
+    curves: dict = None,
     output_path: str = "diagnostic.png",
 ) -> None:
     """Save a 3-panel diagnostic image with a right-aligned table of transforms.
@@ -61,14 +119,22 @@ def create_diagnostic_image(
                     FONT, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
         return bar
 
-    panels_img = [prep(reference), prep(match_original), prep(match_aligned)]
-    labels_img  = ["Reference", "Input (simulated)", "Best Alignment"]
+    ref_panel     = prep(reference)
+    input_panel   = prep(match_original)
+    aligned_panel = prep(match_aligned)
+    # 4th panel: 50/50 alpha blend of reference and aligned image.
+    # Misaligned features appear as ghosting; well-aligned areas look sharp.
+    overlay_panel = cv2.addWeighted(ref_panel, 0.5, aligned_panel, 0.5, 0)
+
+    panels_img = [ref_panel, input_panel, aligned_panel, overlay_panel]
+    labels_img  = ["Reference", "Input (simulated)", "Best Alignment", "Overlay"]
     cols_img = [np.vstack([p, label_bar(l)])
                 for p, l in zip(panels_img, labels_img)]
     gap_strip = np.full((PANEL + LABEL_H, GAP, 3), 15, dtype=np.uint8)
-    row = np.hstack([cols_img[0], gap_strip, cols_img[1], gap_strip, cols_img[2]])
+    row = np.hstack([cols_img[0], gap_strip, cols_img[1],
+                     gap_strip, cols_img[2], gap_strip, cols_img[3]])
 
-    total_w = row.shape[1]   # 916 px for PANEL=300, GAP=8
+    total_w = row.shape[1]   # 4*PANEL + 3*GAP = 1224 px for PANEL=300, GAP=8
     sep = np.full((2, total_w, 3), 60, dtype=np.uint8)
     info = np.full((INFO_H, total_w, 3), 20, dtype=np.uint8)
 
@@ -92,12 +158,14 @@ def create_diagnostic_image(
         cv2.putText(canvas, text, (cx - cell_w(text) // 2, y),
                     FONT, FS, color, FT, cv2.LINE_AA)
 
-    # Column right-edge x positions; values are right-aligned to (rx - MARGIN).
-    # 7 data columns fill total_w=916; label column occupies x < LABEL_END.
+    # Column right-edge x positions computed dynamically from total_w so the
+    # table always fills the full image width regardless of panel count.
     LABEL_X   = 10
     LABEL_END = 90   # right edge of label column
-    MARGIN    = 4    # gap between text and column right edge
-    COL_R     = [195, 313, 431, 544, 657, 770, 883]
+    MARGIN    = 4    # gap between cell text and its right edge
+    N_COLS    = 7
+    _span     = total_w - LABEL_END
+    COL_R     = [LABEL_END + round((i + 1) * _span / N_COLS) for i in range(N_COLS)]
     HEADERS   = ["ROT",  "PAN",  "TILT", "X",  "Y",  "ZOOM",  "GAMMA"]
 
     # ------------------------------------------------------------------ header row
@@ -173,5 +241,10 @@ def create_diagnostic_image(
     for x in [LABEL_END] + COL_R[:-1]:
         cv2.line(info, (x, SEP1_Y + 1), (x, SEP2_Y - 1), DIV_COLOR, 1)
 
-    cv2.imwrite(output_path, np.vstack([row, sep, info]))
+    parts = [row, sep, info]
+    plot_strip = render_correlation_plots(curves or {}, total_w)
+    if plot_strip.shape[0] > 0:
+        parts += [np.full((2, total_w, 3), 40, dtype=np.uint8), plot_strip]
+
+    cv2.imwrite(output_path, np.vstack(parts))
     print(f"  Saved diagnostic: {output_path}")
