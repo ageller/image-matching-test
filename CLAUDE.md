@@ -11,9 +11,14 @@ matcher recovers a *known* applied transform.
 
 Two entry points in `main.py`:
 - `run_simulation_test()` — apply a random transform to each `raw_images/` image,
-  run the matcher, save a diagnostic. This is what `python main.py` runs.
-- `align_real_images(img1, img2, output_dir)` — match two real photos, no
-  simulation. Returns a dict of found params + the aligned image.
+  run the matcher, save a diagnostic. This is what `python main.py` runs. With
+  `save_simulated=True` (default) it also writes `output/<stem>_simulated.png`
+  per image — a synthetic second photo for testing `align_real_images`.
+- `align_real_images(img1, img2, output_dir="output", matcher="de", ...)` — match
+  two real photos, no simulation. Runs the same matcher/metric (knobs mirror
+  `run_simulation_test`), saves `<stem2>_aligned.png` + a real-mode diagnostic
+  `<stem2>_aligned_diagnostic.png`, and returns a dict of found params + the
+  aligned image.
 
 ## Architecture
 
@@ -41,18 +46,30 @@ with `uv`. Run with `uv run python main.py`; one-off checks with
 - **Neutral parameter values** (a disabled transform collapses to these):
   `angle=0, pan=0, tilt=0, dx=0, dy=0, zoom=1`; lighting: `gamma=1, contrast=1,
   brightness=0, temp=0, shade=0`.
-- **Canonical geometry composition** is `apply_alignment`, order
-  `zoom → translate → perspective → rotate`. Used by both matchers and the
-  output builder. Don't reorder without updating all three call sites.
+- **Two composed geometry warps**, exact functional inverses of each other,
+  each applied as ONE `warpPerspective` (never as separate per-op warps —
+  sequential warps clip to the frame at every step and compound interpolation
+  blur, which can crop away enough content to make a transform unrecoverable):
+  - `apply_capture_warp` — forward "capture" order `rotate → perspective →
+    translate → zoom`. Used by the simulation to build the second photo.
+  - `apply_alignment` — recovery order `zoom → translate → perspective →
+    rotate`. Used by both matchers (to score candidates) and the output builder.
+  Because the orders are reverses and the params negate/reciprocate,
+  `apply_alignment(apply_capture_warp(x, p), inverse(p)) == x` up to off-frame
+  clipping. Don't reorder either without updating the other and all call sites.
 
 ### transforms.py notes
 
-- `apply_perspective` builds the homography `H = K·R·K⁻¹` with `K` assuming the
-  principal point at image center and focal length `f = w` (~53° FOV). The
-  rotation `R` is built via `scipy.spatial.transform.Rotation.from_euler('xy',
-  [tilt, pan], degrees=True)` — this is **exactly** the old hand-rolled
-  `Ry(pan) @ Rx(tilt)` (verified bit-identical). It then prepends a translation
-  so the warped center stays in frame.
+- The geometry warps are assembled from 3×3 matrices via two private helpers:
+  `_affine_to_3x3` (promote a cv2 2×3 affine) and `_perspective_matrix` (the
+  pan/tilt homography). `_perspective_matrix` builds `H = K·R·K⁻¹` with `K`
+  assuming the principal point at image center and `f = w` (~53° FOV); `R` is
+  `scipy.spatial.transform.Rotation.from_euler('xy', [tilt, pan], degrees=True)`
+  — **exactly** the old hand-rolled `Ry(pan) @ Rx(tilt)` (verified
+  bit-identical). It prepends a translation so the warped center stays in frame.
+  (There is no standalone `apply_perspective`/`apply_zoom`/`apply_translation`/
+  `rotate_image` anymore — they were removed once both composed warps existed;
+  don't reintroduce single-op warp helpers.)
 - Photometric transforms (`apply_brightness_contrast`, `apply_color_temperature`,
   `apply_illumination_gradient`) are **simulation-only** — they are applied to
   build the synthetic second photo but are **never searched/recovered**. The
@@ -88,17 +105,47 @@ with `uv`. Run with `uv run python main.py`; one-off checks with
 ### diagnostics.py notes
 
 - `create_diagnostic_image` renders 4 panels (Reference / Input / Best Alignment
-  / Overlay) + a geometry table + a lighting footer + correlation-curve plots.
-- **Table is geometry-only**: columns `ROT PAN TILT X Y ZOOM` (`N_COLS = 6`),
-  rows `Applied / Found / Expected / Residual`, plus a `Step` row **only for the
-  greedy matcher** (DE has no per-parameter step). `Expected` is the true inverse
-  of `Applied`; `Residual = Found − Expected` (0 = perfect).
-- **Lighting params go in a footer line** (`lighting_applied` dict with keys
-  `gamma, contrast, brightness, temp, shade, shade_angle`), NOT in the table —
-  they are applied but never recovered.
-- `INFO_H` adapts: base `145` (greedy) / `128` (DE), `+17` for the lighting line.
-  If you add/remove a table row or footer line, re-check this and the
-  `ROW_Y0 / SEP2_Y / light_y / corr_y` arithmetic.
+  / Overlay) + a geometry table + (simulated only) a lighting footer +
+  correlation-curve plots. Required args are the `*_found` values + `correlation`;
+  the `*_applied` / `lighting_applied` args are **optional** and signal the mode.
+- **Two modes**, detected by `rotation_applied is not None`:
+  - **Simulated** (run_simulation_test passes ground truth): table rows
+    `Applied / Found / Expected / Residual` + an applied-lighting footer.
+    `Expected` is the true inverse of `Applied`; `Residual = Found − Expected`
+    (0 = perfect).
+  - **Real** (align_real_images omits ground truth): only the `Found` row, no
+    lighting footer. `input_label` names the second photo.
+- Table is geometry-only: columns `ROT PAN TILT X Y ZOOM` (`N_COLS = 6`). A
+  greedy-only `Step` row is appended in both modes (DE has no per-parameter step).
+- Lighting params (simulated mode) go in a footer line, NOT the table
+  (`lighting_applied` dict: `gamma, contrast, brightness, temp, shade, shade_angle`)
+  — applied but never recovered.
+- `INFO_H` is **computed up front** from `n_rows` (4 simulated / 1 real, +1 for a
+  greedy Step row) and whether the lighting line is present, via the
+  `HDR_Y / SEP1_Y / ROW_Y0 / ROW_H / SEP2_Y / light_y / corr_y` chain near the top
+  of the function. If you add/remove a row or footer line, adjust `n_rows` /
+  that chain — don't hard-code heights.
+
+## Known limitation: recoverability
+
+Some inputs are **unrecoverable** — the matcher genuinely can't (and shouldn't be
+expected to) align them, because the information is gone, not because of an
+optimizer or metric bug:
+- A strong **zoom-in** crops the subject off the fixed canvas; zooming back out
+  only reveals black, not the lost content.
+- **Severe lighting** (e.g. a heavy brightening gamma) flattens contrast until
+  little structure remains.
+When that happens the correct alignment has nothing to correlate, and the search
+can settle on a different higher-correlation configuration. Verified for the old
+img3 case: the geometrically-correct alignment scored *below* a spurious basin
+under every `norm_method`, and high-pass normalization didn't fix it (it just
+regressed the working cases) — so **don't try to "harden the metric" to recover
+lost-information cases; it can't work.** The lever that helps is keeping inputs
+recoverable. The simulation ranges are deliberately moderated for this:
+**zoom-in capped at 1.20**, **gamma kept off the extremes** (bright floor 0.4,
+dark ceiling 3.0). The same caveat applies to real photos. Note strong *combined*
+distortion (large perspective + rotation together) can still leave a multimodal
+landscape where the search lands in a wrong basin.
 
 ## Gotchas
 

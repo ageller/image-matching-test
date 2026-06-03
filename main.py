@@ -3,9 +3,8 @@ import random
 from pathlib import Path
 
 from transforms import (
-    rotate_image, apply_gamma, apply_perspective, apply_translation, apply_zoom,
-    apply_alignment, apply_brightness_contrast, apply_color_temperature,
-    apply_illumination_gradient,
+    apply_gamma, apply_capture_warp, apply_alignment, apply_brightness_contrast,
+    apply_color_temperature, apply_illumination_gradient,
 )
 from matching import find_best_alignment_greedy, find_best_alignment_de
 from diagnostics import create_diagnostic_image
@@ -18,12 +17,18 @@ def run_simulation_test(
     """Run the full simulation pipeline on every image in raw_dir.
 
     For each image:
-      1. Apply random rotation + perspective + translation + zoom + gamma
-         to produce a simulated second photo.
-      2. Run find_best_alignment to recover the transforms.
+      1. Apply a random geometric warp (rotation + perspective + translation +
+         zoom, via apply_capture_warp) plus photometric/lighting effects to
+         produce a simulated second photo.
+      2. Run the selected matcher (greedy or DE) to recover the geometry.
       3. Save a diagnostic PNG showing reference / input / aligned images
          alongside a table of applied vs found vs expected values.
     """
+
+    random_seed = 1234567   # img1=success img2=success img3=fail
+    # random_seed = 1111111   # img1=fail    img2=fail    img3=success
+    # random_seed = 2222222   # img1=success img2=success img3=fail
+
     # Which transforms to APPLY when simulating the second photo.
     # Toggle these to build a simpler test case (e.g. rotation only).
     # A disabled transform collapses to its neutral value (nothing applied).
@@ -38,6 +43,11 @@ def run_simulation_test(
     sim_brightness_contrast = True  # linear exposure (contrast + offset)
     sim_color_temp = True         # white-balance / color-temperature shift
     sim_shading = True            # directional illumination gradient
+
+    # Save each simulated "second photo" to output/<stem>_simulated.png.  Handy
+    # for feeding back into align_real_images to test it end-to-end (align a
+    # saved simulated image against its original reference).
+    save_simulated = True
 
     # Which transforms to SEARCH during matching — toggle to test subsets.
     # Independent of the sim_* flags above, but for a clean test the searched
@@ -84,20 +94,21 @@ def run_simulation_test(
     step_rot = 1.0      # degrees, in-plane rotation
     step_persp = 5.0    # degrees, pan and tilt
     step_trans = 5.0    # pixels, x and y translation
-    zoom_step = round(zoom_values[1] - zoom_values[0], 4)  # = 0.05; for diagnostics display
+    # = 0.05; for diagnostics display
+    zoom_step = round(zoom_values[1] - zoom_values[0], 4)
     # Iterative refinement: re-sweep up to n_passes times so coupled parameters
     # (esp. rotation↔translation) re-converge.  Stops early when a pass changes
     # nothing.  verbose prints each pass's parameter vector.
     n_passes = 3
 
     # ---- DE-only settings (ignored when matcher == 'greedy') -------
-    de_popsize = 15     # population = popsize * n_enabled_params
-    de_maxiter = 100    # max generations
-    de_tol = 0.01       # convergence tolerance
-    de_seed = 1234567   # reproducibility (DE is stochastic)
-    de_downscale = 1.0  # 1.0 = full res; lower trades accuracy for speed
+    de_popsize = 15        # population = popsize * n_enabled_params
+    de_maxiter = 100       # max generations
+    de_tol = 0.01          # convergence tolerance
+    de_seed = random_seed  # reproducibility (DE is stochastic)
+    de_downscale = 1.0     # 1.0 = full res; lower trades accuracy for speed
 
-    random.seed(1234567)
+    random.seed(random_seed)
 
     raw_path = Path(raw_dir)
     out_path = Path(output_dir)
@@ -133,34 +144,49 @@ def run_simulation_test(
                      if sim_translation else 0.0)
         y_applied = (random.choice([random.uniform(-40, -10), random.uniform(10, 40)])
                      if sim_translation else 0.0)
-        zoom_applied = (random.choice([random.uniform(0.75, 0.90), random.uniform(1.10, 1.35)])
+        # Zoom-in capped at 1.20 (not 1.35): a strong zoom-in crops the subject
+        # off the fixed canvas, and that lost content cannot be recovered by
+        # zooming back out — see the "recoverability" note in the README.
+        zoom_applied = (random.choice([random.uniform(0.75, 0.90), random.uniform(1.10, 1.20)])
                         if sim_zoom else 1.0)
+        # Gamma extremes moderated (bright floor 0.4 not 0.2; dark ceiling 3.0
+        # not 4.0) so the simulated photo stays a recoverable "bad lighting"
+        # case rather than a near-featureless, contrast-crushed one.
         gamma_applied = (random.choice([
-            random.uniform(0.2, 0.5),   # overexposed / bright environment
-            random.uniform(1.5, 4.0),   # underexposed / dim environment
+            random.uniform(0.4, 0.6),   # overexposed / bright environment
+            random.uniform(1.5, 3.0),   # underexposed / dim environment
         ]) if sim_gamma else 1.0)
-        contrast_applied = (random.uniform(0.7, 1.3) if sim_brightness_contrast else 1.0)
-        brightness_applied = (random.uniform(-40.0, 40.0) if sim_brightness_contrast else 0.0)
+        contrast_applied = (random.uniform(0.7, 1.3)
+                            if sim_brightness_contrast else 1.0)
+        brightness_applied = (random.uniform(-40.0, 40.0)
+                              if sim_brightness_contrast else 0.0)
         temp_applied = (random.choice([random.uniform(-0.3, -0.1), random.uniform(0.1, 0.3)])
                         if sim_color_temp else 0.0)
         shade_applied = (random.uniform(0.2, 0.5) if sim_shading else 0.0)
-        shade_angle_applied = (random.uniform(0.0, 360.0) if sim_shading else 0.0)
+        shade_angle_applied = (random.uniform(
+            0.0, 360.0) if sim_shading else 0.0)
 
-        # Geometric warp first, then photometric effects on top.
-        match = rotate_image(reference, rotation_applied)
-        match = apply_perspective(match, pan_applied, tilt_applied)
-        match = apply_translation(match, x_applied, y_applied)
-        match = apply_zoom(match, zoom_applied)
-        match = apply_illumination_gradient(match, shade_applied, shade_angle_applied)
+        # Geometric warp first (single composed warp — see apply_capture_warp),
+        # then photometric effects on top.
+        match = apply_capture_warp(
+            reference, angle=rotation_applied, pan=pan_applied, tilt=tilt_applied,
+            dx=x_applied, dy=y_applied, zoom=zoom_applied)
+        match = apply_illumination_gradient(
+            match, shade_applied, shade_angle_applied)
         match = apply_color_temperature(match, temp_applied)
         match = apply_gamma(match, gamma_applied)
-        match = apply_brightness_contrast(match, contrast_applied, brightness_applied)
+        match = apply_brightness_contrast(
+            match, contrast_applied, brightness_applied)
 
         lighting_applied = {
             'gamma': gamma_applied, 'contrast': contrast_applied,
             'brightness': brightness_applied, 'temp': temp_applied,
             'shade': shade_applied, 'shade_angle': shade_angle_applied,
         }
+
+        if save_simulated:
+            sim_path = out_path / f"{img_path.stem}_simulated.png"
+            cv2.imwrite(str(sim_path), match)
 
         print(f"\n--- {img_path.name} ---")
         print(f"  Applied  rot={rotation_applied:+.1f}  pan={pan_applied:+.1f}"
@@ -287,18 +313,44 @@ def run_simulation_test(
 def align_real_images(
     img1_path: str,
     img2_path: str,
-    output_dir: str | None = None,
+    output_dir: str | None = "output",
+    matcher: str = "de",
+    # --- correlation metric (shared) ---
+    norm_method: str | None = None,
+    corr_method: str = "spearman",
+    blur_sigma: float = 0.0,
+    # --- search ranges (shared) ---
+    persp_range: float = 30.0,
+    trans_range: float = 50.0,
+    zoom_values: tuple = (0.70, 0.75, 0.80, 0.85, 0.90, 0.95,
+                          1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40),
+    # --- greedy-only ---
+    step_rot: float = 1.0,
+    step_persp: float = 5.0,
+    step_trans: float = 5.0,
+    n_passes: int = 3,
+    # --- de-only ---
+    de_popsize: int = 15,
+    de_maxiter: int = 100,
+    de_tol: float = 0.01,
+    de_seed: int = 1234567,
+    de_downscale: float = 1.0,
 ) -> dict:
     """Find the best alignment between two real photos of the same subject.
 
     Unlike run_simulation_test, no transforms are applied — both images are
-    taken as-is (e.g. two separate photos of the same person).  The function
-    runs the same find_best_alignment search and returns the found parameters.
+    taken as-is (e.g. two separate photos of the same person).  It runs the same
+    search (matcher + metric knobs mirror run_simulation_test) over all four
+    geometric transforms and, because there is no ground-truth transform, the
+    diagnostic shows only the Found row (no Applied/Expected/Residual/lighting).
 
     Args:
         img1_path:  path to the reference image
         img2_path:  path to the image to align to the reference
-        output_dir: if provided, saves the aligned image as aligned.png there
+        output_dir: if set (default 'output'), saves <stem2>_aligned.png and
+                    <stem2>_aligned_diagnostic.png there; pass None to skip.
+        matcher:    'de' (global, recommended) or 'greedy'.
+        (remaining args mirror the matcher/metric knobs in run_simulation_test.)
 
     Returns:
         dict with keys: rotation, pan, tilt, x_offset, y_offset, zoom,
@@ -311,12 +363,28 @@ def align_real_images(
     if match is None:
         raise FileNotFoundError(f"Cannot load match image: {img2_path}")
 
-    print(f"Aligning '{Path(img2_path).name}' to '{Path(img1_path).name}' ...")
-    print(f"  Searching: rotation 360 deg | pan/tilt ±30 deg"
-          f" | x/y ±50 px | zoom 0.70-1.40 ...")
+    print(f"Aligning '{Path(img2_path).name}' to '{Path(img1_path).name}'"
+          f" (matcher={matcher}) ...")
 
-    best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr, _ = \
-        find_best_alignment_greedy(reference, match)
+    if matcher == "de":
+        best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr, curves = \
+            find_best_alignment_de(
+                reference, match,
+                persp_range=persp_range, trans_range=trans_range,
+                zoom_values=zoom_values,
+                norm_method=norm_method, corr_method=corr_method,
+                blur_sigma=blur_sigma,
+                popsize=de_popsize, maxiter=de_maxiter, tol=de_tol,
+                seed=de_seed, downscale=de_downscale, verbose=True)
+    else:
+        best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr, curves = \
+            find_best_alignment_greedy(
+                reference, match,
+                step_rot=step_rot, step_persp=step_persp, step_trans=step_trans,
+                persp_range=persp_range, trans_range=trans_range,
+                zoom_values=zoom_values,
+                norm_method=norm_method, corr_method=corr_method,
+                blur_sigma=blur_sigma, n_passes=n_passes, verbose=True)
 
     match_aligned = apply_alignment(match, angle=best_angle, pan=best_pan,
                                     tilt=best_tilt, dx=best_dx, dy=best_dy,
@@ -328,9 +396,42 @@ def align_real_images(
     print(f"  Correlation: {best_corr:.4f}")
 
     if output_dir:
-        out_path = Path(output_dir) / "aligned.png"
-        cv2.imwrite(str(out_path), match_aligned)
-        print(f"  Saved: {out_path}")
+        out_path = Path(output_dir)
+        out_path.mkdir(exist_ok=True)
+        stem = Path(img2_path).stem
+        aligned_path = out_path / f"{stem}_aligned.png"
+        cv2.imwrite(str(aligned_path), match_aligned)
+        print(f"  Saved: {aligned_path}")
+
+        # Real-image diagnostic: no ground truth, so applied/lighting are omitted
+        # (create_diagnostic_image shows only the Found row in this mode).
+        create_diagnostic_image(
+            reference=reference,
+            match_original=match,
+            match_aligned=match_aligned,
+            rotation_found=best_angle,
+            pan_found=best_pan,
+            tilt_found=best_tilt,
+            x_found=best_dx,
+            y_found=best_dy,
+            zoom_found=best_zoom,
+            correlation=best_corr,
+            input_label=f"Image 2 ({Path(img2_path).name})",
+            step_rot=step_rot,
+            step_persp=step_persp,
+            step_trans=step_trans,
+            zoom_step=round(zoom_values[1] - zoom_values[0], 4),
+            norm_method=norm_method,
+            corr_method=corr_method,
+            matcher=matcher,
+            n_passes=n_passes,
+            de_settings={
+                'popsize': de_popsize, 'maxiter': de_maxiter, 'tol': de_tol,
+                'seed': de_seed, 'downscale': de_downscale,
+            },
+            curves=curves,
+            output_path=str(out_path / f"{stem}_aligned_diagnostic.png"),
+        )
 
     return {
         "rotation":      best_angle,
@@ -345,4 +446,16 @@ def align_real_images(
 
 
 if __name__ == "__main__":
+    # Run the simulation on every image in raw_images/ (saves diagnostics to
+    # output/).  With save_simulated=True it also writes output/<stem>_simulated.png
+    # for each image — a synthetic "second photo" you can feed to align_real_images.
     run_simulation_test()
+
+    # Then align a real (or simulated) second photo against its reference.  E.g.
+    # to verify on a saved simulated image (reference vs its own warped+relit copy):
+    #
+    #   align_real_images("raw_images/img1.jpg", "output/img1_simulated.png")
+    #
+    # or align two genuinely separate photos of the same subject:
+    #
+    #   align_real_images("photo_a.jpg", "photo_b.jpg", output_dir="output")

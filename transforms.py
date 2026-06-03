@@ -3,17 +3,6 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 
-def rotate_image(image: np.ndarray, angle: float) -> np.ndarray:
-    """Rotate image by angle (degrees, CCW in standard coords) around center.
-    Output is the same size as input; corners outside the frame become black."""
-    h, w = image.shape[:2]
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    return cv2.warpAffine(image, M, (w, h),
-                          flags=cv2.INTER_LINEAR,
-                          borderMode=cv2.BORDER_CONSTANT,
-                          borderValue=0)
-
-
 def apply_gamma(image: np.ndarray, gamma: float) -> np.ndarray:
     """Apply gamma correction to a BGR or grayscale image via a lookup table.
     gamma < 1: brightens (simulates overexposure / bright environment)
@@ -78,8 +67,13 @@ def apply_illumination_gradient(image: np.ndarray, strength: float,
     return np.clip(out * factor, 0, 255).astype(np.uint8)
 
 
-def apply_perspective(image: np.ndarray, pan_deg: float, tilt_deg: float) -> np.ndarray:
-    """Apply a 3D perspective warp to simulate a viewpoint change.
+def _affine_to_3x3(affine_2x3: np.ndarray) -> np.ndarray:
+    """Promote a 2×3 affine matrix (cv2 convention) to a 3×3 homography."""
+    return np.vstack([affine_2x3, [0.0, 0.0, 1.0]])
+
+
+def _perspective_matrix(w: int, h: int, pan_deg: float, tilt_deg: float) -> np.ndarray:
+    """Build the 3×3 perspective homography for a viewpoint change (pan/tilt).
 
     Models the image as a flat plane viewed through a pinhole camera, then
     rotates the plane around the Y-axis (pan left/right) and X-axis (tilt
@@ -99,9 +93,10 @@ def apply_perspective(image: np.ndarray, pan_deg: float, tilt_deg: float) -> np.
 
     pan_deg  > 0: subject appears to turn right (camera shifts left)
     tilt_deg > 0: subject appears to tilt upward (camera shifts down)
-    """
-    h, w = image.shape[:2]
 
+    Returns the 3×3 matrix (not the warped image) so apply_alignment and
+    apply_capture_warp can compose it with the other transforms into one warp.
+    """
     # --- Principal point assumed at image center; see docstring ---
     cx, cy = w / 2.0, h / 2.0
     f = float(w)  # focal length heuristic: image width ≈ 53 deg horizontal FOV
@@ -126,35 +121,7 @@ def apply_perspective(image: np.ndarray, pan_deg: float, tilt_deg: float) -> np.
     T = np.eye(3, dtype=np.float64)
     T[0, 2] = cx - p[0]
     T[1, 2] = cy - p[1]
-    H = T @ H
-
-    return cv2.warpPerspective(image, H, (w, h),
-                               flags=cv2.INTER_LINEAR,
-                               borderMode=cv2.BORDER_CONSTANT,
-                               borderValue=0)
-
-
-def apply_translation(image: np.ndarray, dx: float, dy: float) -> np.ndarray:
-    """Translate image by (dx, dy) pixels. dx>0 shifts right, dy>0 shifts down.
-    Content shifted off-frame is filled with black."""
-    h, w = image.shape[:2]
-    M = np.array([[1.0, 0.0, dx],
-                  [0.0, 1.0, dy]], dtype=np.float64)
-    return cv2.warpAffine(image, M, (w, h),
-                          flags=cv2.INTER_LINEAR,
-                          borderMode=cv2.BORDER_CONSTANT,
-                          borderValue=0)
-
-
-def apply_zoom(image: np.ndarray, scale: float) -> np.ndarray:
-    """Zoom in (scale>1) or out (scale<1) around the image center.
-    Content that falls outside the frame is filled with black."""
-    h, w = image.shape[:2]
-    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), 0.0, scale)
-    return cv2.warpAffine(image, M, (w, h),
-                          flags=cv2.INTER_LINEAR,
-                          borderMode=cv2.BORDER_CONSTANT,
-                          borderValue=0)
+    return T @ H
 
 
 def apply_alignment(
@@ -169,10 +136,11 @@ def apply_alignment(
     """Apply all alignment transforms in the physically correct order:
       zoom → translate → perspective → rotate
 
-    This is the canonical composition used everywhere: in the search
-    (find_best_alignment), when constructing the aligned output image, and
-    as the basis for testing different parameter combinations.  All parameters
-    default to their neutral values so any subset can be applied.
+    This is the canonical composition used everywhere: inside the matchers
+    (find_best_alignment_greedy / _de) to score candidates, when constructing
+    the aligned output image, and as the basis for testing different parameter
+    combinations.  All parameters default to their neutral values so any subset
+    can be applied.  It is the exact functional inverse of apply_capture_warp.
 
     Order rationale:
       zoom first   — scale correction before any positional adjustment so that
@@ -181,12 +149,75 @@ def apply_alignment(
       perspective  — 3-D viewpoint warp applied in the image's natural orientation,
                      before any in-plane rotation changes that orientation
       rotate last  — in-plane tilt correction on top of everything else
+
+    The four steps are composed into ONE 3×3 homography and applied with a
+    single warpPerspective.  This matters: applying them as four separate warps
+    clips to the frame at every intermediate step, so content pushed off-frame
+    by (say) the zoom is lost to black even if a later step would bring it back.
+    Composing first means only the FINAL position clips, and the image is
+    resampled once instead of four times (less interpolation blur).
     """
-    img = apply_zoom(image, zoom)
-    img = apply_translation(img, dx, dy)
-    img = apply_perspective(img, pan, tilt)
-    img = rotate_image(img, angle)
-    return img
+    h, w = image.shape[:2]
+    cx, cy = w / 2.0, h / 2.0
+
+    H_zoom  = _affine_to_3x3(cv2.getRotationMatrix2D((cx, cy), 0.0, zoom))
+    H_trans = np.array([[1.0, 0.0, dx],
+                        [0.0, 1.0, dy],
+                        [0.0, 0.0, 1.0]], dtype=np.float64)
+    H_persp = _perspective_matrix(w, h, pan, tilt)
+    H_rot   = _affine_to_3x3(cv2.getRotationMatrix2D((cx, cy), angle, 1.0))
+
+    # Composition order is the reverse of application order: the matrix applied
+    # last (rotation) sits leftmost.  H · x first zooms x, then translates, …
+    H = H_rot @ H_persp @ H_trans @ H_zoom
+
+    return cv2.warpPerspective(image, H, (w, h),
+                               flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_CONSTANT,
+                               borderValue=0)
+
+
+def apply_capture_warp(
+    image: np.ndarray,
+    angle: float = 0.0,
+    pan: float = 0.0,
+    tilt: float = 0.0,
+    dx: float = 0.0,
+    dy: float = 0.0,
+    zoom: float = 1.0,
+) -> np.ndarray:
+    """Forward 'capture' geometry as a SINGLE composed warp, in the order
+      rotate → perspective → translate → zoom
+
+    Models how a second photo is framed (subject orientation, then viewpoint,
+    then framing offset, then focal-length/zoom).  This is the exact functional
+    inverse of apply_alignment — same operations, reverse order — so
+    apply_alignment(apply_capture_warp(x, p), inverse(p)) recovers x up to
+    off-frame clipping.
+
+    Used by the simulation to build the synthetic second photo.  As with
+    apply_alignment, composing into one warp (vs four sequential ones) avoids
+    compounding interpolation blur and intermediate-frame clipping — the latter
+    can otherwise crop away so much content that the transform is no longer
+    recoverable.
+    """
+    h, w = image.shape[:2]
+    cx, cy = w / 2.0, h / 2.0
+
+    H_rot   = _affine_to_3x3(cv2.getRotationMatrix2D((cx, cy), angle, 1.0))
+    H_persp = _perspective_matrix(w, h, pan, tilt)
+    H_trans = np.array([[1.0, 0.0, dx],
+                        [0.0, 1.0, dy],
+                        [0.0, 0.0, 1.0]], dtype=np.float64)
+    H_zoom  = _affine_to_3x3(cv2.getRotationMatrix2D((cx, cy), 0.0, zoom))
+
+    # rotate applied first (rightmost), zoom last (leftmost).
+    H = H_zoom @ H_trans @ H_persp @ H_rot
+
+    return cv2.warpPerspective(image, H, (w, h),
+                               flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_CONSTANT,
+                               borderValue=0)
 
 
 def to_grayscale(image: np.ndarray) -> np.ndarray:

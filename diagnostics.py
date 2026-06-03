@@ -73,13 +73,6 @@ def create_diagnostic_image(
     reference: np.ndarray,
     match_original: np.ndarray,
     match_aligned: np.ndarray,
-    rotation_applied: float,
-    pan_applied: float,
-    tilt_applied: float,
-    x_applied: float,
-    y_applied: float,
-    zoom_applied: float,
-    lighting_applied: dict,
     rotation_found: float,
     pan_found: float,
     tilt_found: float,
@@ -87,10 +80,20 @@ def create_diagnostic_image(
     y_found: float,
     zoom_found: float,
     correlation: float,
-    step_rot: float,
-    step_persp: float,
-    step_trans: float,
-    zoom_step: float,
+    # Ground-truth transform — supplied only by the simulation (run_simulation_test);
+    # leave as None for real images (align_real_images), which have no ground truth.
+    rotation_applied: float | None = None,
+    pan_applied: float | None = None,
+    tilt_applied: float | None = None,
+    x_applied: float | None = None,
+    y_applied: float | None = None,
+    zoom_applied: float | None = None,
+    lighting_applied: dict | None = None,
+    input_label: str = "Input (simulated)",
+    step_rot: float = 1.0,
+    step_persp: float = 5.0,
+    step_trans: float = 5.0,
+    zoom_step: float = 0.05,
     search_rotation: bool = True,
     search_zoom: bool = True,
     search_translation: bool = True,
@@ -105,33 +108,53 @@ def create_diagnostic_image(
 ) -> None:
     """Save a 4-panel diagnostic image with a table of recovered transforms.
       Left:   Reference image (the target)
-      Center: Input image (simulated geometric warp + photometric/lighting)
+      Center: Input image (the second photo being aligned)
       Right:  Best-aligned image (found transforms applied to input)
       Bottom: Table with columns ROT / PAN / TILT / X / Y / ZOOM (the geometry
               the matcher recovers) and rows:
-                Applied — values used to create the simulated image
+                Applied — values used to create the simulated image *
                 Found   — values recovered by the search algorithm
-                Expected— the true inverse of Applied (perfect target)
-                Residual— Found minus Expected (0 = perfect recovery)
+                Expected— the true inverse of Applied (perfect target) *
+                Residual— Found minus Expected (0 = perfect recovery) *
                 Step    — greedy search step per parameter (row omitted for DE,
                           which has no per-parameter step)
       Footer: the photometric/lighting parameters that were APPLIED but are not
-              recovered (gamma/contrast/brightness/temp/shading), then a line
+              recovered (gamma/contrast/brightness/temp/shading) *, then a line
               with the correlation score and the matcher + its settings.
 
-    `lighting_applied` is a dict with keys gamma, contrast, brightness, temp,
-    shade, shade_angle (the simulated lighting nuisance parameters).
+    * Rows/footer marked with an asterisk are ground-truth comparisons and are
+    shown only in SIMULATED mode (run_simulation_test), detected by
+    rotation_applied being supplied.  For REAL images (align_real_images) the
+    ground-truth args are left None: only the Found row is shown, there is no
+    lighting footer, and `input_label` should name the second photo.
+
+    `lighting_applied` (simulated mode) is a dict with keys gamma, contrast,
+    brightness, temp, shade, shade_angle (the lighting nuisance parameters).
     """
     PANEL   = 300
     GAP     = 8
     LABEL_H = 32
-    # Info panel height: greedy shows 5 data rows (incl. Step), DE shows 4
-    # (no per-parameter step), so shrink the panel by one row height for DE.
-    # The extra +17 leaves room for the lighting footer line below the table.
-    INFO_H  = (145 if matcher != "de" else 128) + 17
     FONT    = cv2.FONT_HERSHEY_SIMPLEX
     FS      = 0.42   # font scale for table text
     FT      = 1      # font thickness
+
+    # Simulated mode (known ground truth) shows Applied/Found/Expected/Residual
+    # rows + an applied-lighting footer.  Real-image mode has no ground truth, so
+    # it shows only the Found row and no lighting footer.
+    simulated = rotation_applied is not None
+
+    # --- table/footer vertical layout (drives INFO_H, computed up front) ---
+    HDR_Y  = 14            # header baseline
+    SEP1_Y = HDR_Y + 6     # divider below header
+    ROW_Y0 = SEP1_Y + 14   # baseline of first data row
+    ROW_H  = 17
+    # Data rows: simulated → Applied/Found/Expected/Residual (4); real → Found (1).
+    # Plus a greedy-only Step row (DE has no per-parameter step).
+    n_rows  = (4 if simulated else 1) + (0 if matcher == "de" else 1)
+    SEP2_Y  = ROW_Y0 + n_rows * ROW_H + 2
+    light_y = (SEP2_Y + ROW_H - 3) if simulated else None   # applied-lighting line
+    corr_y  = (light_y + ROW_H) if simulated else (SEP2_Y + ROW_H - 3)
+    INFO_H  = corr_y + 10
 
     # ------------------------------------------------------------------ panels
     def prep(img: np.ndarray) -> np.ndarray:
@@ -154,7 +177,7 @@ def create_diagnostic_image(
     overlay_panel = cv2.addWeighted(ref_panel, 0.5, aligned_panel, 0.5, 0)
 
     panels_img = [ref_panel, input_panel, aligned_panel, overlay_panel]
-    labels_img  = ["Reference", "Input (simulated)", "Best Alignment", "Overlay"]
+    labels_img  = ["Reference", input_label, "Best Alignment", "Overlay"]
     cols_img = [np.vstack([p, label_bar(l)])
                 for p, l in zip(panels_img, labels_img)]
     gap_strip = np.full((PANEL + LABEL_H, GAP, 3), 15, dtype=np.uint8)
@@ -196,8 +219,6 @@ def create_diagnostic_image(
     HEADERS   = ["ROT",  "PAN",  "TILT", "X",  "Y",  "ZOOM"]
 
     # ------------------------------------------------------------------ header row
-    HDR_Y  = 14
-    SEP1_Y = HDR_Y + 6   # horizontal line below header
     prev = LABEL_END
     for hdr, rx in zip(HEADERS, COL_R):
         put_c(info, hdr, (prev + rx) // 2, HDR_Y)
@@ -205,37 +226,35 @@ def create_diagnostic_image(
     cv2.line(info, (0, SEP1_Y), (total_w, SEP1_Y), DIV_COLOR, 1)
 
     # ------------------------------------------------------------------ data rows
-    # Error = found − expected_inverse (0 means perfect recovery).
-    # For rotation: expected inverse = (360 − applied) % 360; normalize to [−180, 180].
-    # For pan/tilt/x/y: expected inverse = −applied, so error = found + applied.
-    # For zoom: expected inverse = 1 / applied, so error = found − 1/applied.
-    exp_rot  = (360.0 - rotation_applied) % 360.0
-    rot_err  = rotation_found - exp_rot
-    rot_err  = (rot_err + 180) % 360 - 180   # normalize to [−180, 180]
-    pan_err  = pan_found  + pan_applied
-    tilt_err = tilt_found + tilt_applied
-    x_err    = x_found    + x_applied
-    y_err    = y_found    + y_applied
-    zoom_err = zoom_found - (1.0 / zoom_applied)
-
-    ROW_Y0 = SEP1_Y + 14   # baseline of first data row
-    ROW_H  = 17
-
+    # The Found row is always shown.  In simulated mode we also know the applied
+    # transform, so we add Applied / Expected (its true inverse) / Residual.
     # (label, rot, pan, tilt, x, y, zoom)
     rows = [
-        ("Applied:",
-         f"{rotation_applied:+.1f}", f"{pan_applied:+.1f}", f"{tilt_applied:+.1f}",
-         f"{x_applied:+.0f}", f"{y_applied:+.0f}", f"{zoom_applied:.2f}"),
         ("Found:",
          f"{rotation_found:+.1f}", f"{pan_found:+.1f}", f"{tilt_found:+.1f}",
          f"{x_found:+.0f}", f"{y_found:+.0f}", f"{zoom_found:.2f}"),
-        ("Expected:",
-         f"{exp_rot:.1f}", f"{-pan_applied:+.1f}", f"{-tilt_applied:+.1f}",
-         f"{-x_applied:+.0f}", f"{-y_applied:+.0f}", f"{1.0/zoom_applied:.2f}"),
-        ("Residual:",
-         f"{rot_err:+.1f}", f"{pan_err:+.1f}", f"{tilt_err:+.1f}",
-         f"{x_err:+.0f}", f"{y_err:+.0f}", f"{zoom_err:+.2f}"),
     ]
+    if simulated:
+        # Error = found − expected_inverse (0 means perfect recovery).
+        # rotation: expected inverse = (360 − applied) % 360; normalize to [−180, 180].
+        # pan/tilt/x/y: expected inverse = −applied, so error = found + applied.
+        # zoom: expected inverse = 1 / applied, so error = found − 1/applied.
+        exp_rot  = (360.0 - rotation_applied) % 360.0
+        rot_err  = (rotation_found - exp_rot + 180) % 360 - 180
+        rows = [
+            ("Applied:",
+             f"{rotation_applied:+.1f}", f"{pan_applied:+.1f}", f"{tilt_applied:+.1f}",
+             f"{x_applied:+.0f}", f"{y_applied:+.0f}", f"{zoom_applied:.2f}"),
+            rows[0],
+            ("Expected:",
+             f"{exp_rot:.1f}", f"{-pan_applied:+.1f}", f"{-tilt_applied:+.1f}",
+             f"{-x_applied:+.0f}", f"{-y_applied:+.0f}", f"{1.0/zoom_applied:.2f}"),
+            ("Residual:",
+             f"{rot_err:+.1f}",
+             f"{pan_found + pan_applied:+.1f}", f"{tilt_found + tilt_applied:+.1f}",
+             f"{x_found + x_applied:+.0f}", f"{y_found + y_applied:+.0f}",
+             f"{zoom_found - 1.0/zoom_applied:+.2f}"),
+        ]
 
     # Step row: greedy shows each per-parameter step size ('---' when a
     # transform is disabled).  DE has no per-parameter step, so the row is
@@ -257,21 +276,21 @@ def create_diagnostic_image(
             if val:
                 put_r(info, val, rx - MARGIN, y_pos)
 
-    # ------------------------------------------------------------------ separators, lighting & correlation
-    SEP2_Y = ROW_Y0 + len(rows) * ROW_H + 2
+    # ----------------------------------------------- separators, lighting & correlation
+    # SEP2_Y / light_y / corr_y were computed up front (they drive INFO_H).
     cv2.line(info, (0, SEP2_Y), (total_w, SEP2_Y), DIV_COLOR, 1)
 
-    # Lighting footer: photometric nuisances that were APPLIED but not recovered.
-    lg = lighting_applied or {}
-    light_y = SEP2_Y + ROW_H - 3
-    light_str = (f"Lighting applied:  gamma={lg.get('gamma', 1.0):.2f}"
-                 f"   contrast={lg.get('contrast', 1.0):.2f}"
-                 f"   bright={lg.get('brightness', 0.0):+.0f}"
-                 f"   temp={lg.get('temp', 0.0):+.2f}"
-                 f"   shade={lg.get('shade', 0.0):.2f}@{lg.get('shade_angle', 0.0):.0f}deg")
-    put_l(info, light_str, LABEL_X, light_y, HDR_COLOR)
+    # Lighting footer (simulated mode only): photometric nuisances that were
+    # APPLIED but not recovered.
+    if simulated:
+        lg = lighting_applied or {}
+        light_str = (f"Lighting applied:  gamma={lg.get('gamma', 1.0):.2f}"
+                     f"   contrast={lg.get('contrast', 1.0):.2f}"
+                     f"   bright={lg.get('brightness', 0.0):+.0f}"
+                     f"   temp={lg.get('temp', 0.0):+.2f}"
+                     f"   shade={lg.get('shade', 0.0):.2f}@{lg.get('shade_angle', 0.0):.0f}deg")
+        put_l(info, light_str, LABEL_X, light_y, HDR_COLOR)
 
-    corr_y = light_y + ROW_H
     put_l(info, f"Correlation score ({norm_method or 'none'}/{corr_method}): {correlation:.4f}",
           LABEL_X, corr_y, CORR_COLOR)
 
