@@ -79,7 +79,7 @@ def create_diagnostic_image(
     x_applied: float,
     y_applied: float,
     zoom_applied: float,
-    gamma_applied: float,
+    lighting_applied: dict,
     rotation_found: float,
     pan_found: float,
     tilt_found: float,
@@ -103,23 +103,32 @@ def create_diagnostic_image(
     curves: dict = None,
     output_path: str = "diagnostic.png",
 ) -> None:
-    """Save a 3-panel diagnostic image with a right-aligned table of transforms.
+    """Save a 4-panel diagnostic image with a table of recovered transforms.
       Left:   Reference image (the target)
-      Center: Input image (simulated: rotation + perspective + translate + zoom + gamma)
+      Center: Input image (simulated geometric warp + photometric/lighting)
       Right:  Best-aligned image (found transforms applied to input)
-      Bottom: Table with columns ROT / PAN / TILT / X / Y / ZOOM / GAMMA and rows:
+      Bottom: Table with columns ROT / PAN / TILT / X / Y / ZOOM (the geometry
+              the matcher recovers) and rows:
                 Applied — values used to create the simulated image
                 Found   — values recovered by the search algorithm
-                Error   — found minus expected-inverse (0 = perfect recovery)
-                Step    — greedy search step per parameter ('__' when matcher
-                          is DE, which has no per-parameter step)
-      The footer line shows the matcher and its settings (n_passes for greedy,
-      population/iterations/tol/seed/downscale for DE).
+                Expected— the true inverse of Applied (perfect target)
+                Residual— Found minus Expected (0 = perfect recovery)
+                Step    — greedy search step per parameter (row omitted for DE,
+                          which has no per-parameter step)
+      Footer: the photometric/lighting parameters that were APPLIED but are not
+              recovered (gamma/contrast/brightness/temp/shading), then a line
+              with the correlation score and the matcher + its settings.
+
+    `lighting_applied` is a dict with keys gamma, contrast, brightness, temp,
+    shade, shade_angle (the simulated lighting nuisance parameters).
     """
     PANEL   = 300
     GAP     = 8
     LABEL_H = 32
-    INFO_H  = 145
+    # Info panel height: greedy shows 5 data rows (incl. Step), DE shows 4
+    # (no per-parameter step), so shrink the panel by one row height for DE.
+    # The extra +17 leaves room for the lighting footer line below the table.
+    INFO_H  = (145 if matcher != "de" else 128) + 17
     FONT    = cv2.FONT_HERSHEY_SIMPLEX
     FS      = 0.42   # font scale for table text
     FT      = 1      # font thickness
@@ -181,10 +190,10 @@ def create_diagnostic_image(
     LABEL_X   = 10
     LABEL_END = 90   # right edge of label column
     MARGIN    = 4    # gap between cell text and its right edge
-    N_COLS    = 7
+    N_COLS    = 6
     _span     = total_w - LABEL_END
     COL_R     = [LABEL_END + round((i + 1) * _span / N_COLS) for i in range(N_COLS)]
-    HEADERS   = ["ROT",  "PAN",  "TILT", "X",  "Y",  "ZOOM",  "GAMMA"]
+    HEADERS   = ["ROT",  "PAN",  "TILT", "X",  "Y",  "ZOOM"]
 
     # ------------------------------------------------------------------ header row
     HDR_Y  = 14
@@ -197,12 +206,12 @@ def create_diagnostic_image(
 
     # ------------------------------------------------------------------ data rows
     # Error = found − expected_inverse (0 means perfect recovery).
-    # For rotation: expected inverse = (360 − applied) % 360; normalise to [−180, 180].
+    # For rotation: expected inverse = (360 − applied) % 360; normalize to [−180, 180].
     # For pan/tilt/x/y: expected inverse = −applied, so error = found + applied.
     # For zoom: expected inverse = 1 / applied, so error = found − 1/applied.
     exp_rot  = (360.0 - rotation_applied) % 360.0
     rot_err  = rotation_found - exp_rot
-    rot_err  = (rot_err + 180) % 360 - 180   # normalise to [−180, 180]
+    rot_err  = (rot_err + 180) % 360 - 180   # normalize to [−180, 180]
     pan_err  = pan_found  + pan_applied
     tilt_err = tilt_found + tilt_applied
     x_err    = x_found    + x_applied
@@ -212,41 +221,34 @@ def create_diagnostic_image(
     ROW_Y0 = SEP1_Y + 14   # baseline of first data row
     ROW_H  = 17
 
-    # Step row cells: DE has no per-parameter step, so show '--' everywhere;
-    # greedy shows each step size, or '---' for a disabled transform.
-    if matcher == "de":
-        step_cells = ("--", "--", "--", "--", "--", "--", "")
-    else:
-        step_cells = (
+    # (label, rot, pan, tilt, x, y, zoom)
+    rows = [
+        ("Applied:",
+         f"{rotation_applied:+.1f}", f"{pan_applied:+.1f}", f"{tilt_applied:+.1f}",
+         f"{x_applied:+.0f}", f"{y_applied:+.0f}", f"{zoom_applied:.2f}"),
+        ("Found:",
+         f"{rotation_found:+.1f}", f"{pan_found:+.1f}", f"{tilt_found:+.1f}",
+         f"{x_found:+.0f}", f"{y_found:+.0f}", f"{zoom_found:.2f}"),
+        ("Expected:",
+         f"{exp_rot:.1f}", f"{-pan_applied:+.1f}", f"{-tilt_applied:+.1f}",
+         f"{-x_applied:+.0f}", f"{-y_applied:+.0f}", f"{1.0/zoom_applied:.2f}"),
+        ("Residual:",
+         f"{rot_err:+.1f}", f"{pan_err:+.1f}", f"{tilt_err:+.1f}",
+         f"{x_err:+.0f}", f"{y_err:+.0f}", f"{zoom_err:+.2f}"),
+    ]
+
+    # Step row: greedy shows each per-parameter step size ('---' when a
+    # transform is disabled).  DE has no per-parameter step, so the row is
+    # omitted entirely.
+    if matcher != "de":
+        rows.append(("Step:",
             f"{step_rot:.1f}"   if search_rotation    else "---",
             f"{step_persp:.1f}" if search_perspective else "---",
             f"{step_persp:.1f}" if search_perspective else "---",
             f"{step_trans:.1f}" if search_translation else "---",
             f"{step_trans:.1f}" if search_translation else "---",
             f"{zoom_step:.2f}"  if search_zoom        else "---",
-            "",
-        )
-
-    # (label, rot, pan, tilt, x, y, zoom, gamma)
-    rows = [
-        ("Applied:",
-         f"{rotation_applied:+.1f}", f"{pan_applied:+.1f}", f"{tilt_applied:+.1f}",
-         f"{x_applied:+.0f}", f"{y_applied:+.0f}",
-         f"{zoom_applied:.2f}", f"{gamma_applied:.2f}"),
-        ("Found:",
-         f"{rotation_found:+.1f}", f"{pan_found:+.1f}", f"{tilt_found:+.1f}",
-         f"{x_found:+.0f}", f"{y_found:+.0f}",
-         f"{zoom_found:.2f}", ""),
-        ("Expected:",
-         f"{exp_rot:.1f}", f"{-pan_applied:+.1f}", f"{-tilt_applied:+.1f}",
-         f"{-x_applied:+.0f}", f"{-y_applied:+.0f}",
-         f"{1.0/zoom_applied:.2f}", ""),
-        ("Residual:",
-         f"{rot_err:+.1f}", f"{pan_err:+.1f}", f"{tilt_err:+.1f}",
-         f"{x_err:+.0f}", f"{y_err:+.0f}",
-         f"{zoom_err:+.2f}", ""),
-        ("Step:", *step_cells),
-    ]
+        ))
 
     for i, (lbl, *vals) in enumerate(rows):
         y_pos = ROW_Y0 + i * ROW_H
@@ -255,10 +257,21 @@ def create_diagnostic_image(
             if val:
                 put_r(info, val, rx - MARGIN, y_pos)
 
-    # ------------------------------------------------------------------ separators & correlation
+    # ------------------------------------------------------------------ separators, lighting & correlation
     SEP2_Y = ROW_Y0 + len(rows) * ROW_H + 2
     cv2.line(info, (0, SEP2_Y), (total_w, SEP2_Y), DIV_COLOR, 1)
-    corr_y = SEP2_Y + ROW_H - 2
+
+    # Lighting footer: photometric nuisances that were APPLIED but not recovered.
+    lg = lighting_applied or {}
+    light_y = SEP2_Y + ROW_H - 3
+    light_str = (f"Lighting applied:  gamma={lg.get('gamma', 1.0):.2f}"
+                 f"   contrast={lg.get('contrast', 1.0):.2f}"
+                 f"   bright={lg.get('brightness', 0.0):+.0f}"
+                 f"   temp={lg.get('temp', 0.0):+.2f}"
+                 f"   shade={lg.get('shade', 0.0):.2f}@{lg.get('shade_angle', 0.0):.0f}deg")
+    put_l(info, light_str, LABEL_X, light_y, HDR_COLOR)
+
+    corr_y = light_y + ROW_H
     put_l(info, f"Correlation score ({norm_method or 'none'}/{corr_method}): {correlation:.4f}",
           LABEL_X, corr_y, CORR_COLOR)
 

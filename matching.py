@@ -10,7 +10,7 @@ def compute_correlation(img1: np.ndarray, img2: np.ndarray,
                         norm_method: str = "gradient",
                         corr_method: str = "pearson",
                         blur_sigma: float = 0.0) -> float:
-    """Correlation over a fixed circular centre region.
+    """Correlation over a fixed circular center region.
 
     Expects grayscale (2D) input — callers must convert before passing.
 
@@ -46,7 +46,7 @@ def compute_correlation(img1: np.ndarray, img2: np.ndarray,
     Common pipeline for every norm_method:
       1. Border mask built BEFORE any remap (warp fill is exactly 0; later
          steps can change those values, so the mask must use raw pixels).
-      2. Fixed circular centre mask of radius 0.80 × min(w,h)/2 so the same
+      2. Fixed circular center mask of radius 0.80 × min(w,h)/2 so the same
          pixel set is compared at every rotation angle — without it, angles
          near 0°/90° have larger valid areas than 45°, biasing the metric
          toward multiples of 90°.
@@ -59,10 +59,10 @@ def compute_correlation(img1: np.ndarray, img2: np.ndarray,
          fixed mask keeps n constant across candidates, so no extra pixel-count
          normalization is needed.
     """
-    _MIN_PIX   = 1000
+    _MIN_PIX = 1000
     _CIRC_FRAC = 0.80   # circle radius as fraction of min(w,h)/2
-    _CLIP      = 2.0
-    _TILE      = (8, 8)
+    _CLIP = 2.0
+    _TILE = (8, 8)
 
     h, w = img1.shape
 
@@ -72,7 +72,7 @@ def compute_correlation(img1: np.ndarray, img2: np.ndarray,
 
     # Step 2 — fixed circular mask
     cy, cx = h / 2.0, w / 2.0
-    r      = min(cx, cy) * _CIRC_FRAC
+    r = min(cx, cy) * _CIRC_FRAC
     ys, xs = np.ogrid[:h, :w]
     circle = (xs - cx) ** 2 + (ys - cy) ** 2 <= r ** 2
 
@@ -121,7 +121,7 @@ def compute_correlation(img1: np.ndarray, img2: np.ndarray,
     return 0.0 if np.isnan(r) else float(r)
 
 
-def find_best_alignment(
+def find_best_alignment_greedy(
     reference: np.ndarray,
     match: np.ndarray,
     # --- which transforms to search ---
@@ -157,12 +157,12 @@ def find_best_alignment(
     current best value (not just the ones found earlier this pass).
 
     Iterative refinement (n_passes): the parameters are coupled — notably
-    rotation and translation, because rotation is about the IMAGE CENTRE, so an
-    uncorrected translation (off-centre subject) biases the rotation step that
+    rotation and translation, because rotation is about the IMAGE CENTER, so an
+    uncorrected translation (off-center subject) biases the rotation step that
     runs before it.  A single greedy sweep can therefore lock in a wrong angle.
     Repeating the sweep lets each parameter re-converge against the others'
     improved estimates (fixed-point iteration): pass 2's rotation step runs
-    with pass 1's translation applied, so the subject is re-centred and the
+    with pass 1's translation applied, so the subject is re-centered and the
     angle sharpens, and so on.  The loop stops early when a full pass changes
     nothing (the grid search has reached a fixed point).  Coupling requires at
     least two active searches, so a single active search runs only one pass.
@@ -180,7 +180,7 @@ def find_best_alignment(
     # CLAHE is applied inside compute_correlation after each transform, so
     # normalization is always in the aligned coordinate frame.  Pass raw
     # grayscale here; do NOT pre-apply CLAHE.
-    ref_gray   = to_grayscale(reference)
+    ref_gray = to_grayscale(reference)
     match_gray = to_grayscale(match)
 
     # Local shorthand so every candidate uses the same metric settings.
@@ -190,12 +190,12 @@ def find_best_alignment(
                                    blur_sigma=blur_sigma)
 
     best_angle = 0.0
-    best_pan   = 0.0
-    best_tilt  = 0.0
-    best_dx    = 0.0
-    best_dy    = 0.0
-    best_zoom  = 1.0
-    best_corr  = corr(ref_gray, match_gray)  # baseline
+    best_pan = 0.0
+    best_tilt = 0.0
+    best_dx = 0.0
+    best_dy = 0.0
+    best_zoom = 1.0
+    best_corr = corr(ref_gray, match_gray)  # baseline
 
     curves: dict = {}
 
@@ -212,7 +212,7 @@ def find_best_alignment(
         # Step 1: rotation — sweep angle, hold every other param at current best
         if search_rotation:
             rot_angles = np.arange(0.0, 360.0, step_rot)
-            rot_corrs  = np.array([
+            rot_corrs = np.array([
                 corr(ref_gray, apply_alignment(
                     match_gray, angle=float(a), zoom=best_zoom,
                     dx=best_dx, dy=best_dy, pan=best_pan, tilt=best_tilt))
@@ -220,14 +220,14 @@ def find_best_alignment(
             ])
             best_idx = int(np.argmax(rot_corrs))
             if rot_corrs[best_idx] > best_corr:
-                best_corr  = float(rot_corrs[best_idx])
+                best_corr = float(rot_corrs[best_idx])
                 best_angle = float(rot_angles[best_idx])
             curves['rotation'] = {'x': rot_angles, 'y': rot_corrs,
                                   'best': best_angle, 'label': 'Rotation (deg)'}
 
         # Step 2: zoom — sweep zoom, hold every other param at current best
         if search_zoom:
-            zoom_arr   = np.array(zoom_values, dtype=float)
+            zoom_arr = np.array(zoom_values, dtype=float)
             zoom_corrs = np.array([
                 corr(ref_gray, apply_alignment(
                     match_gray, angle=best_angle, zoom=float(z),
@@ -243,8 +243,10 @@ def find_best_alignment(
 
         # Step 3: translation — sweep dx,dy; hold every other param at best
         if search_translation:
-            dx_vals = np.arange(-trans_range, trans_range + step_trans, step_trans)
-            dy_vals = np.arange(-trans_range, trans_range + step_trans, step_trans)
+            dx_vals = np.arange(-trans_range, trans_range +
+                                step_trans, step_trans)
+            dy_vals = np.arange(-trans_range, trans_range +
+                                step_trans, step_trans)
             trans_mat = np.zeros((len(dx_vals), len(dy_vals)))
             for i, dx in enumerate(dx_vals):
                 for j, dy in enumerate(dy_vals):
@@ -256,8 +258,8 @@ def find_best_alignment(
             best_ij = np.unravel_index(np.argmax(trans_mat), trans_mat.shape)
             if trans_mat[best_ij] > best_corr:
                 best_corr = float(trans_mat[best_ij])
-                best_dx   = float(dx_vals[best_ij[0]])
-                best_dy   = float(dy_vals[best_ij[1]])
+                best_dx = float(dx_vals[best_ij[0]])
+                best_dy = float(dy_vals[best_ij[1]])
             bi = int(np.argmin(np.abs(dx_vals - best_dx)))
             bj = int(np.argmin(np.abs(dy_vals - best_dy)))
             curves['dx'] = {'x': dx_vals, 'y': trans_mat[:, bj],
@@ -267,8 +269,10 @@ def find_best_alignment(
 
         # Step 4: perspective — sweep pan,tilt; hold every other param at best
         if search_perspective:
-            pan_vals  = np.arange(-persp_range, persp_range + step_persp, step_persp)
-            tilt_vals = np.arange(-persp_range, persp_range + step_persp, step_persp)
+            pan_vals = np.arange(-persp_range, persp_range +
+                                 step_persp, step_persp)
+            tilt_vals = np.arange(-persp_range,
+                                  persp_range + step_persp, step_persp)
             persp_mat = np.zeros((len(pan_vals), len(tilt_vals)))
             for i, pan in enumerate(pan_vals):
                 for j, tilt in enumerate(tilt_vals):
@@ -280,12 +284,12 @@ def find_best_alignment(
             best_ij = np.unravel_index(np.argmax(persp_mat), persp_mat.shape)
             if persp_mat[best_ij] > best_corr:
                 best_corr = float(persp_mat[best_ij])
-                best_pan  = float(pan_vals[best_ij[0]])
+                best_pan = float(pan_vals[best_ij[0]])
                 best_tilt = float(tilt_vals[best_ij[1]])
-            bi = int(np.argmin(np.abs(pan_vals  - best_pan)))
+            bi = int(np.argmin(np.abs(pan_vals - best_pan)))
             bj = int(np.argmin(np.abs(tilt_vals - best_tilt)))
-            curves['pan']  = {'x': pan_vals,  'y': persp_mat[:, bj],
-                              'best': best_pan,  'label': 'Pan (deg)'}
+            curves['pan'] = {'x': pan_vals,  'y': persp_mat[:, bj],
+                             'best': best_pan,  'label': 'Pan (deg)'}
             curves['tilt'] = {'x': tilt_vals, 'y': persp_mat[bi, :],
                               'best': best_tilt, 'label': 'Tilt (deg)'}
 
@@ -331,7 +335,7 @@ def find_best_alignment_de(
     genetic-family optimizer).  Drop-in alternative to find_best_alignment with
     the SAME 8-tuple return signature.
 
-    Unlike the greedy sweep, DE optimizes the full parameter vector JOINTLY over
+    Unlike the brute-force greedy sweep, DE optimizes the full parameter vector JOINTLY over
     a population of candidates, so coupled parameters (notably rotation↔
     translation) are handled at once and the multimodal landscape is explored
     from many seeds — sidestepping the "wrong basin" failure of coordinate
@@ -349,19 +353,21 @@ def find_best_alignment_de(
     are scaled by `downscale` and the recovered dx/dy are scaled back to full-
     resolution pixels; all other parameters are resolution-independent.  The
     reported correlation is always recomputed at full resolution for
-    comparability with the greedy matcher.
+    comparability with the brute-force greedy matcher.
 
     seed makes the (stochastic) search reproducible.  Returns curves with a
     single 'convergence' entry (best correlation vs DE generation) so the
     existing diagnostic plot panel still renders something meaningful.
     """
-    ref_gray   = to_grayscale(reference)
+    ref_gray = to_grayscale(reference)
     match_gray = to_grayscale(match)
 
     s = float(downscale)
     if s != 1.0:
-        ref_opt   = cv2.resize(ref_gray,   None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-        match_opt = cv2.resize(match_gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        ref_opt = cv2.resize(ref_gray,   None, fx=s, fy=s,
+                             interpolation=cv2.INTER_AREA)
+        match_opt = cv2.resize(match_gray, None, fx=s,
+                               fy=s, interpolation=cv2.INTER_AREA)
     else:
         ref_opt, match_opt = ref_gray, match_gray
 
@@ -391,7 +397,7 @@ def find_best_alignment_de(
         return (0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
                 corr(ref_gray, match_gray), {})
 
-    names  = [n for n, _, _ in specs]
+    names = [n for n, _, _ in specs]
     bounds = [(lo, hi) for _, lo, hi in specs]
 
     def vec_to_params(x):
@@ -421,11 +427,11 @@ def find_best_alignment_de(
     # Convert translation back to full-resolution pixels (other params are
     # resolution-independent).
     best_angle = p['angle']
-    best_zoom  = p['zoom']
-    best_dx    = p['dx'] / s
-    best_dy    = p['dy'] / s
-    best_pan   = p['pan']
-    best_tilt  = p['tilt']
+    best_zoom = p['zoom']
+    best_dx = p['dx'] / s
+    best_dy = p['dy'] / s
+    best_pan = p['pan']
+    best_tilt = p['tilt']
 
     # Recompute correlation at full resolution for comparability.
     best_corr = corr(ref_gray, apply_alignment(

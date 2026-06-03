@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 
 def rotate_image(image: np.ndarray, angle: float) -> np.ndarray:
@@ -20,6 +21,61 @@ def apply_gamma(image: np.ndarray, gamma: float) -> np.ndarray:
     """
     lut = np.array([(i / 255.0) ** gamma * 255 for i in range(256)], dtype=np.uint8)
     return cv2.LUT(image, lut)
+
+
+def apply_brightness_contrast(image: np.ndarray, contrast: float = 1.0,
+                              brightness: float = 0.0) -> np.ndarray:
+    """Linear exposure change: out = contrast · (image − 128) + 128 + brightness.
+
+    Models the linear part of an exposure difference between two captures
+    (gamma covers the nonlinear curve).  Contrast pivots about mid-gray (128)
+    so it scales dynamic range without shifting the midtone; brightness then
+    adds a flat offset.
+      contrast   > 1 increases contrast, < 1 flattens it
+      brightness > 0 brightens, < 0 darkens (in 0-255 units)
+    """
+    out = contrast * (image.astype(np.float64) - 128.0) + 128.0 + brightness
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def apply_color_temperature(image: np.ndarray, temp: float) -> np.ndarray:
+    """Shift white balance / color temperature of a BGR image.
+    temp > 0 warms (boosts red, cuts blue); temp < 0 cools (boosts blue, cuts
+    red).  Simulates different ambient lighting between two photos.  No-op on a
+    grayscale (2D) image, which has no color channels to shift.
+    """
+    if image.ndim == 2:
+        return image
+    out = image.astype(np.float64)
+    out[..., 2] *= (1.0 + temp)   # R (BGR order: channel 2)
+    out[..., 0] *= (1.0 - temp)   # B (BGR order: channel 0)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def apply_illumination_gradient(image: np.ndarray, strength: float,
+                                angle_deg: float) -> np.ndarray:
+    """Multiply the image by a smooth linear brightness ramp to simulate
+    directional lighting (light coming from a different side in the second
+    photo).  The ramp runs along `angle_deg` (0 = left→right, 90 = top→bottom)
+    and scales pixels from (1 − strength) on the dark side to (1 + strength) on
+    the bright side.  strength = 0 is a no-op.  Works for grayscale and BGR.
+
+    NOTE: this only reweights existing pixel intensities; it does not relight
+    the 3-D surface, so it cannot reproduce cast shadows or specular highlights
+    that move with the light source.
+    """
+    h, w = image.shape[:2]
+    ang = np.radians(angle_deg)
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float64)
+    # Normalized so image center is 0 and edges are ±1 along each axis.
+    xn = (xs - w / 2.0) / (w / 2.0)
+    yn = (ys - h / 2.0) / (h / 2.0)
+    proj = np.clip(np.cos(ang) * xn + np.sin(ang) * yn, -1.0, 1.0)
+    factor = 1.0 + strength * proj
+    out = image.astype(np.float64)
+    if out.ndim == 3:
+        factor = factor[..., None]
+    return np.clip(out * factor, 0, 255).astype(np.uint8)
 
 
 def apply_perspective(image: np.ndarray, pan_deg: float, tilt_deg: float) -> np.ndarray:
@@ -54,18 +110,11 @@ def apply_perspective(image: np.ndarray, pan_deg: float, tilt_deg: float) -> np.
                   [0, f, cy],
                   [0, 0,  1]], dtype=np.float64)
 
-    pan  = np.radians(pan_deg)
-    tilt = np.radians(tilt_deg)
-
-    Ry = np.array([[ np.cos(pan), 0, np.sin(pan)],   # rotation around Y (pan)
-                   [ 0,           1, 0           ],
-                   [-np.sin(pan), 0, np.cos(pan)]], dtype=np.float64)
-
-    Rx = np.array([[1, 0,             0            ],  # rotation around X (tilt)
-                   [0, np.cos(tilt), -np.sin(tilt) ],
-                   [0, np.sin(tilt),  np.cos(tilt) ]], dtype=np.float64)
-
-    R = Ry @ Rx  # pan first, then tilt
+    # Extrinsic 'xy' sequence (fixed world axes): rotate about X by tilt, then
+    # about Y by pan.  scipy composes this as Ry(pan) @ Rx(tilt), matching the
+    # previous hand-built `R = Ry @ Rx`.  Using scipy avoids hand-rolling the
+    # rotation matrices and their composition.
+    R = Rotation.from_euler('xy', [tilt_deg, pan_deg], degrees=True).as_matrix()
     H = K @ R @ np.linalg.inv(K)
 
     # The perspective warp shifts the image center: under a pure pan θ the

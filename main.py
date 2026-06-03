@@ -4,9 +4,10 @@ from pathlib import Path
 
 from transforms import (
     rotate_image, apply_gamma, apply_perspective, apply_translation, apply_zoom,
-    apply_alignment,
+    apply_alignment, apply_brightness_contrast, apply_color_temperature,
+    apply_illumination_gradient,
 )
-from matching import find_best_alignment, find_best_alignment_de
+from matching import find_best_alignment_greedy, find_best_alignment_de
 from diagnostics import create_diagnostic_image
 
 
@@ -30,7 +31,13 @@ def run_simulation_test(
     sim_zoom = True
     sim_translation = True
     sim_perspective = True
-    sim_gamma = True
+    # Photometric (lighting) effects — applied to the simulated second photo but
+    # NOT recovered by the matcher (the gradient/rank correlation is designed to
+    # be robust to them).  Each collapses to neutral when its flag is off.
+    sim_gamma = True              # nonlinear exposure curve
+    sim_brightness_contrast = True  # linear exposure (contrast + offset)
+    sim_color_temp = True         # white-balance / color-temperature shift
+    sim_shading = True            # directional illumination gradient
 
     # Which transforms to SEARCH during matching — toggle to test subsets.
     # Independent of the sim_* flags above, but for a clean test the searched
@@ -40,38 +47,50 @@ def run_simulation_test(
     search_translation = True
     search_perspective = True
 
-    # Search step sizes — adjust to trade off speed vs precision.
-    step_rot = 1.0    # degrees, in-plane rotation
-    step_persp = 5.0    # degrees, pan and tilt
-    persp_range = 30.0   # degrees, pan/tilt search range ±
-    step_trans = 5.0    # pixels, x and y translation
-    trans_range = 50.0   # pixels, translation search range ±
-    zoom_values = (0.70, 0.75, 0.80, 0.85, 0.90, 0.95,
-                   1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40)
-    zoom_step = round(zoom_values[1] - zoom_values[0], 4)   # = 0.05
+    # ================================================================
+    # Matcher selection — picks WHICH search algorithm runs below.
+    #   'greedy' — coordinate-descent sweep over a discrete grid.
+    #   'de'     — Differential Evolution: global, joint optimization of all
+    #              enabled parameters at once.
+    # The settings below are split into three groups: shared (both matchers),
+    # greedy-only, and de-only.  Settings outside the active matcher's group
+    # are ignored.
+    # ================================================================
+    matcher = "de"
 
-    # Feature compared (norm_method): None | 'clahe' | 'gradient'.
-    # None       — raw intensity, cleanest baseline.
-    # 'gradient' — lighting-robust and rotation-equivariant.
-    # 'clahe'    — lighting-robust but not rotation-equivariant.
-    # Correlation (corr_method): 'pearson' | 'spearman'.
-    # 'spearman' is rank-based, exactly gamma-invariant — use when gamma is on.
-    # blur_sigma > 0 smooths the correlation landscape (0 disables).
+    # ---- SHARED settings (apply to BOTH matchers) ------------------
+    # Correlation metric.
+    #   norm_method (feature compared): None | 'clahe' | 'gradient'.
+    #     None       — raw intensity, cleanest baseline.
+    #     'gradient' — lighting-robust and rotation-equivariant.
+    #     'clahe'    — lighting-robust but not rotation-equivariant.
+    #   corr_method: 'pearson' | 'spearman'.
+    #     'spearman' is rank-based, exactly gamma-invariant — use when gamma is on.
+    #   blur_sigma > 0 smooths the correlation landscape (0 disables).
     norm_method = None
     corr_method = "spearman"
     blur_sigma = 0.0
 
-    # Matcher: 'greedy' (coordinate-descent sweep) | 'de' (Differential
-    # Evolution — global, joint optimization of all parameters at once).
-    matcher = "de"
+    # Search ranges — greedy sweeps WITHIN these; DE uses them as bounds.
+    persp_range = 30.0   # degrees, pan/tilt search range ±
+    trans_range = 50.0   # pixels, x/y translation search range ±
+    zoom_values = (0.70, 0.75, 0.80, 0.85, 0.90, 0.95,
+                   1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40)
+    # greedy treats this as the discrete grid of zoom values; DE uses only its
+    # min and max as continuous bounds.
 
-    # Iterative refinement (GREEDY MATCHER ONLY — ignored when matcher == 'de'):
-    # re-sweep the search up to n_passes times so coupled parameters (esp.
-    # rotation↔translation) re-converge.  Stops early when a pass changes
+    # ---- GREEDY-only settings (ignored when matcher == 'de') -------
+    # Step sizes — the grid resolution for each swept parameter (speed vs precision).
+    step_rot = 1.0      # degrees, in-plane rotation
+    step_persp = 5.0    # degrees, pan and tilt
+    step_trans = 5.0    # pixels, x and y translation
+    zoom_step = round(zoom_values[1] - zoom_values[0], 4)  # = 0.05; for diagnostics display
+    # Iterative refinement: re-sweep up to n_passes times so coupled parameters
+    # (esp. rotation↔translation) re-converge.  Stops early when a pass changes
     # nothing.  verbose prints each pass's parameter vector.
     n_passes = 3
 
-    # DE controls (only used when matcher == 'de').
+    # ---- DE-only settings (ignored when matcher == 'greedy') -------
     de_popsize = 15     # population = popsize * n_enabled_params
     de_maxiter = 100    # max generations
     de_tol = 0.01       # convergence tolerance
@@ -99,10 +118,12 @@ def run_simulation_test(
             print(f"Could not load {img_path}, skipping.")
             continue
 
-        # Simulate a second image: rotation + perspective + translation + zoom + gamma.
+        # Simulate a second image: geometric warp (rotation + perspective +
+        # translation + zoom) followed by photometric/lighting effects.
         # In production these would be two separately captured photos of the same person.
         # Each transform is only applied if its sim_* flag is on; otherwise the
-        # value collapses to neutral (rot=0, pan/tilt=0, dx/dy=0, zoom=1, gamma=1).
+        # value collapses to neutral (rot=0, pan/tilt=0, dx/dy=0, zoom=1,
+        # gamma=1, contrast=1, brightness=0, temp=0, shade=0).
         rotation_applied = random.uniform(10.0, 350.0) if sim_rotation else 0.0
         pan_applied = (random.choice([random.uniform(-30, -5), random.uniform(5, 30)])
                        if sim_perspective else 0.0)
@@ -118,22 +139,36 @@ def run_simulation_test(
             random.uniform(0.2, 0.5),   # overexposed / bright environment
             random.uniform(1.5, 4.0),   # underexposed / dim environment
         ]) if sim_gamma else 1.0)
+        contrast_applied = (random.uniform(0.7, 1.3) if sim_brightness_contrast else 1.0)
+        brightness_applied = (random.uniform(-40.0, 40.0) if sim_brightness_contrast else 0.0)
+        temp_applied = (random.choice([random.uniform(-0.3, -0.1), random.uniform(0.1, 0.3)])
+                        if sim_color_temp else 0.0)
+        shade_applied = (random.uniform(0.2, 0.5) if sim_shading else 0.0)
+        shade_angle_applied = (random.uniform(0.0, 360.0) if sim_shading else 0.0)
 
-        match = apply_gamma(
-            apply_zoom(
-                apply_translation(
-                    apply_perspective(
-                        rotate_image(reference, rotation_applied),
-                        pan_applied, tilt_applied),
-                    x_applied, y_applied),
-                zoom_applied),
-            gamma_applied,
-        )
+        # Geometric warp first, then photometric effects on top.
+        match = rotate_image(reference, rotation_applied)
+        match = apply_perspective(match, pan_applied, tilt_applied)
+        match = apply_translation(match, x_applied, y_applied)
+        match = apply_zoom(match, zoom_applied)
+        match = apply_illumination_gradient(match, shade_applied, shade_angle_applied)
+        match = apply_color_temperature(match, temp_applied)
+        match = apply_gamma(match, gamma_applied)
+        match = apply_brightness_contrast(match, contrast_applied, brightness_applied)
+
+        lighting_applied = {
+            'gamma': gamma_applied, 'contrast': contrast_applied,
+            'brightness': brightness_applied, 'temp': temp_applied,
+            'shade': shade_applied, 'shade_angle': shade_angle_applied,
+        }
 
         print(f"\n--- {img_path.name} ---")
         print(f"  Applied  rot={rotation_applied:+.1f}  pan={pan_applied:+.1f}"
               f"  tilt={tilt_applied:+.1f}  x={x_applied:+.0f}"
-              f"  y={y_applied:+.0f}  zoom={zoom_applied:.2f}  gamma={gamma_applied:.2f}")
+              f"  y={y_applied:+.0f}  zoom={zoom_applied:.2f}")
+        print(f"  Lighting gamma={gamma_applied:.2f}  contrast={contrast_applied:.2f}"
+              f"  bright={brightness_applied:+.0f}  temp={temp_applied:+.2f}"
+              f"  shade={shade_applied:.2f}@{shade_angle_applied:.0f}deg")
         active = ", ".join(t for t, on in [
             ("rotation", search_rotation), ("zoom", search_zoom),
             ("translation", search_translation), ("perspective", search_perspective),
@@ -163,7 +198,7 @@ def run_simulation_test(
                 )
         else:
             best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr, curves = \
-                find_best_alignment(
+                find_best_alignment_greedy(
                     reference, match,
                     search_rotation=search_rotation,
                     search_zoom=search_zoom,
@@ -220,7 +255,7 @@ def run_simulation_test(
             x_applied=x_applied,
             y_applied=y_applied,
             zoom_applied=zoom_applied,
-            gamma_applied=gamma_applied,
+            lighting_applied=lighting_applied,
             rotation_found=best_angle,
             pan_found=best_pan,
             tilt_found=best_tilt,
@@ -281,7 +316,7 @@ def align_real_images(
           f" | x/y ±50 px | zoom 0.70-1.40 ...")
 
     best_angle, best_pan, best_tilt, best_dx, best_dy, best_zoom, best_corr, _ = \
-        find_best_alignment(reference, match)
+        find_best_alignment_greedy(reference, match)
 
     match_aligned = apply_alignment(match, angle=best_angle, pan=best_pan,
                                     tilt=best_tilt, dx=best_dx, dy=best_dy,
